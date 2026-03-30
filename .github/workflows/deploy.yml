@@ -253,7 +253,7 @@ jobs:
                   \"RuntimeEnvironmentVariables\": {
                     \"PORT\": \"3001\",
                     \"NODE_ENV\": \"production\",
-                    \"NEXTAUTH_URL\": \"https://linker.modumichael.tech\"
+                    \"NEXTAUTH_URL\": \"https://linker.modumichael.me\"
                   },
                   \"RuntimeEnvironmentSecrets\": {
                     \"DATABASE_URL\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:linker/DATABASE_URL\",
@@ -316,7 +316,7 @@ jobs:
           echo "  ✅ Backend Deployment Complete!"
           echo "  🌐 App Runner URL : https://${SERVICE_URL}"
           echo "  🔗 API URL        : https://${SERVICE_URL}/api"
-          echo "  🌍 Custom Domain  : https://api.modumichael.tech/api"
+          echo "  🌍 Custom Domain  : https://api.modumichael.me/api"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
           echo "Copy the API URL and set it as NEXT_PUBLIC_API_URL"
