@@ -1,0 +1,63 @@
+# =============================================================================
+# .dockerignore — Files excluded from the Docker build context
+# =============================================================================
+# Prevents secrets, unnecessary files, and build artifacts from entering
+# the Docker image. Critical for both security and build speed.
+# =============================================================================
+
+# Version control
+.git
+.gitignore
+.gitattributes
+
+# Dependencies (rebuilt inside container via npm ci)
+node_modules/
+.npm/
+
+# Build output (rebuilt inside container)
+dist/
+
+# ⚠️  SECURITY: Never bake secrets into Docker images!
+.env
+.env.*
+!.env.example
+
+# Development tooling config
+.eslintrc*
+.prettierrc*
+.editorconfig
+
+# Documentation
+README.md
+CHANGELOG.md
+docs/
+*.md
+
+# IDE / editor files
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Test files (not needed in production image)
+**/*.spec.ts
+**/*.test.ts
+**/__tests__/
+coverage/
+jest.config*
+
+# CI/CD config (not needed inside container)
+.github/
+
+# Docker files themselves (no need to copy Dockerfile into the image)
+Dockerfile*
+docker-compose*
+.dockerignore
+
+# Logs
+*.log
+logs/

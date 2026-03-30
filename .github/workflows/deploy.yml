@@ -1,0 +1,335 @@
+# =============================================================================
+# GitHub Actions Workflow: Linker Backend — AWS DevSecOps Pipeline Deploy
+# =============================================================================
+#
+# FILE LOCATION:
+#   devops-bootcamp-linker-backend/.github/workflows/deploy.yml
+#
+# PIPELINE STAGES:
+#   1. security-scan  → Gitleaks + npm audit + Trivy image scan
+#   2. build-and-push → Build Docker image → Push to AWS ECR
+#   3. deploy         → Deploy to AWS App Runner
+#
+# REQUIRED GITHUB SECRETS (repo Settings → Secrets → Actions):
+#   AWS_ACCESS_KEY_ID      → IAM user access key
+#   AWS_SECRET_ACCESS_KEY  → IAM user secret key
+#   AWS_REGION             → us-east-1
+#   AWS_ACCOUNT_ID         → Your 12-digit AWS account number
+#   DATABASE_URL           → Neon/Supabase PostgreSQL connection string
+#   NEXTAUTH_SECRET        → Random 32+ char string (openssl rand -base64 32)
+#   CLOUDINARY_CLOUD_NAME  → From cloudinary.com dashboard
+#   CLOUDINARY_API_KEY     → From cloudinary.com dashboard
+#   CLOUDINARY_API_SECRET  → From cloudinary.com dashboard
+#
+# =============================================================================
+
+name: "🚀 Linker Backend — AWS Build, Scan & Deploy"
+
+on:
+  push:
+    branches:
+      - main
+
+# Shared variables for all jobs
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REPOSITORY: linker-backend
+  APP_RUNNER_SERVICE: linker-backend
+  # Constructed from account ID + region
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+jobs:
+  # ===========================================================================
+  # JOB 1: SECURITY SCANNING (DevSecOps Gate)
+  # ===========================================================================
+  # If ANY scan fails, the pipeline stops. No insecure code reaches production.
+  security-scan:
+    name: "🔒 Security Scan"
+    runs-on: ubuntu-latest
+
+    steps:
+      # Download the repository code onto the GitHub Actions runner
+      - name: "📥 Checkout Code"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed for Gitleaks git-log scanning
+
+      # ── SCAN 1: Secret Detection ──────────────────────────────────────────
+      # Gitleaks scans every file AND git history for accidentally committed
+      # secrets: API keys, passwords, connection strings, tokens, etc.
+      # If found → pipeline fails immediately. Never deploy leaked secrets.
+      - name: "🔍 Detect Secrets with Gitleaks"
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── SCAN 2: Dependency Vulnerability Audit ────────────────────────────
+      # npm audit checks package-lock.json against the npm CVE database.
+      # Only fails for HIGH and CRITICAL severity (not LOW/MEDIUM).
+      - name: "⚙️ Set Up Node.js"
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: "📦 Install Dependencies"
+        run: npm ci
+
+      - name: "🔍 Audit npm Dependencies for CVEs"
+        run: |
+          echo "Checking for HIGH and CRITICAL vulnerabilities in npm packages..."
+          # --audit-level=high  = only fail on HIGH+CRITICAL
+          # --omit=dev          = skip devDependencies (not in production)
+          npm audit --audit-level=high --omit=dev
+
+      # ── SCAN 3: Docker Image CVE Scan ─────────────────────────────────────
+      # Build the image here (in security job) so Trivy can scan it.
+      # Trivy scans the OS packages, Node.js libraries, and binary files
+      # inside the Docker image for known CVEs.
+      - name: "🐳 Build Image for Security Scanning"
+        run: |
+          docker build \
+            --tag ${{ env.ECR_REPOSITORY }}:scan \
+            --file Dockerfile \
+            .
+
+      - name: "🛡️ Scan Docker Image with Trivy"
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.ECR_REPOSITORY }}:scan"
+          format: "table"
+          exit-code: "1"          # Block pipeline if vulnerabilities found
+          ignore-unfixed: true    # Skip CVEs with no available fix yet
+          vuln-type: "os,library"
+          severity: "HIGH,CRITICAL"
+
+      # Upload scan results to GitHub Security tab (visible in repo UI)
+      - name: "📊 Generate SARIF Security Report"
+        uses: aquasecurity/trivy-action@master
+        if: always()  # Always run, even if the scan step above failed
+        with:
+          image-ref: "${{ env.ECR_REPOSITORY }}:scan"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "HIGH,CRITICAL"
+
+      - name: "📤 Upload to GitHub Security Tab"
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-results.sarif"
+
+  # ===========================================================================
+  # JOB 2: BUILD AND PUSH TO AWS ECR
+  # ===========================================================================
+  # Only runs if security-scan passes.
+  build-and-push:
+    name: "🐳 Build & Push to ECR"
+    runs-on: ubuntu-latest
+    needs: security-scan  # Depends on security job
+
+    outputs:
+      # Share the image URI with the deploy job
+      image-uri: ${{ steps.build-image.outputs.image-uri }}
+
+    steps:
+      - name: "📥 Checkout Code"
+        uses: actions/checkout@v4
+
+      # Authenticate GitHub Actions runner with AWS
+      # Uses the IAM user credentials stored in GitHub Secrets
+      - name: "🔐 Configure AWS Credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Log Docker into AWS ECR
+      # This generates a temporary token so `docker push` works
+      - name: "🔑 Log in to Amazon ECR"
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build the Docker image and push it to ECR
+      # Tag strategy:
+      #   sha-<7-char-commit-hash> → unique, traceable, immutable
+      #   latest                   → always points to the newest push
+      - name: "🏗️ Build, Tag, and Push Image to ECR"
+        id: build-image
+        env:
+          IMAGE_TAG: sha-${{ github.sha }}
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE_URI="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:sha-${SHORT_SHA}"
+          LATEST_URI="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest"
+
+          echo "Building image: ${IMAGE_URI}"
+
+          # Build for linux/amd64 (App Runner runs on x86_64)
+          docker build \
+            --platform linux/amd64 \
+            --tag "${IMAGE_URI}" \
+            --tag "${LATEST_URI}" \
+            --file Dockerfile \
+            .
+
+          echo "Pushing image to ECR..."
+          docker push "${IMAGE_URI}"
+          docker push "${LATEST_URI}"
+
+          # Save the SHA-tagged URI for the deploy job to use
+          echo "image-uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+          echo "✅ Image pushed: ${IMAGE_URI}"
+
+      # ECR also has built-in image scanning — view results in AWS Console
+      - name: "🔍 Trigger ECR Image Scan"
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          aws ecr start-image-scan \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-id imageTag=sha-${SHORT_SHA} \
+            --region ${{ env.AWS_REGION }} 2>/dev/null || true
+          echo "ECR scan initiated. View results in: AWS Console → ECR → ${{ env.ECR_REPOSITORY }} → Images"
+
+  # ===========================================================================
+  # JOB 3: DEPLOY TO AWS APP RUNNER
+  # ===========================================================================
+  deploy:
+    name: "🚀 Deploy to App Runner"
+    runs-on: ubuntu-latest
+    needs: build-and-push
+
+    steps:
+      - name: "🔐 Configure AWS Credentials"
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Check if the App Runner service already exists
+      # First deploy: CREATE the service
+      # Subsequent deploys: UPDATE the image on the existing service
+      - name: "🔎 Check if App Runner Service Exists"
+        id: check-service
+        run: |
+          SERVICE_ARN=$(aws apprunner list-services \
+            --region ${{ env.AWS_REGION }} \
+            --query "ServiceSummaryList[?ServiceName=='${{ env.APP_RUNNER_SERVICE }}'].ServiceArn" \
+            --output text 2>/dev/null)
+
+          if [ -z "$SERVICE_ARN" ] || [ "$SERVICE_ARN" = "None" ]; then
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Service does not exist — will CREATE"
+          else
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "service-arn=${SERVICE_ARN}" >> $GITHUB_OUTPUT
+            echo "Service exists: ${SERVICE_ARN}"
+          fi
+
+      # FIRST DEPLOY: Create the App Runner service
+      # This runs only once (when the service doesn't exist yet)
+      - name: "🆕 Create App Runner Service (First Deploy)"
+        if: steps.check-service.outputs.exists == 'false'
+        run: |
+          IMAGE_URI="${{ needs.build-and-push.outputs.image-uri }}"
+          ACCOUNT_ID="${{ secrets.AWS_ACCOUNT_ID }}"
+          REGION="${{ env.AWS_REGION }}"
+
+          echo "Creating App Runner service with image: ${IMAGE_URI}"
+
+          aws apprunner create-service \
+            --region "${REGION}" \
+            --service-name "${{ env.APP_RUNNER_SERVICE }}" \
+            --source-configuration "{
+              \"AuthenticationConfiguration\": {
+                \"AccessRoleArn\": \"arn:aws:iam::${ACCOUNT_ID}:role/AppRunnerLinkerRole\"
+              },
+              \"AutoDeploymentsEnabled\": false,
+              \"ImageRepository\": {
+                \"ImageIdentifier\": \"${IMAGE_URI}\",
+                \"ImageRepositoryType\": \"ECR\",
+                \"ImageConfiguration\": {
+                  \"Port\": \"3001\",
+                  \"RuntimeEnvironmentVariables\": {
+                    \"PORT\": \"3001\",
+                    \"NODE_ENV\": \"production\",
+                    \"NEXTAUTH_URL\": \"https://linker.modumichael.me\"
+                  },
+                  \"RuntimeEnvironmentSecrets\": {
+                    \"DATABASE_URL\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:linker/DATABASE_URL\",
+                    \"NEXTAUTH_SECRET\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:linker/NEXTAUTH_SECRET\",
+                    \"CLOUDINARY_CLOUD_NAME\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:linker/CLOUDINARY_CLOUD_NAME\",
+                    \"CLOUDINARY_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:linker/CLOUDINARY_API_KEY\",
+                    \"CLOUDINARY_API_SECRET\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:linker/CLOUDINARY_API_SECRET\"
+                  }
+                }
+              }
+            }" \
+            --instance-configuration "{
+              \"Cpu\": \"1 vCPU\",
+              \"Memory\": \"2 GB\"
+            }" \
+            --health-check-configuration "{
+              \"Protocol\": \"HTTP\",
+              \"Path\": \"/api/health\",
+              \"Interval\": 20,
+              \"Timeout\": 5,
+              \"HealthyThreshold\": 1,
+              \"UnhealthyThreshold\": 5
+            }"
+
+          echo "✅ App Runner service created. Waiting for it to become active..."
+
+          # Wait for service to be running (can take 3-5 minutes on first deploy)
+          aws apprunner wait service-running \
+            --service-arn $(aws apprunner list-services \
+              --region "${REGION}" \
+              --query "ServiceSummaryList[?ServiceName=='${{ env.APP_RUNNER_SERVICE }}'].ServiceArn" \
+              --output text) \
+            --region "${REGION}" || true
+
+      # SUBSEQUENT DEPLOYS: Update the existing service with the new image
+      - name: "🔄 Update App Runner Service (Subsequent Deploys)"
+        if: steps.check-service.outputs.exists == 'true'
+        run: |
+          IMAGE_URI="${{ needs.build-and-push.outputs.image-uri }}"
+          SERVICE_ARN="${{ steps.check-service.outputs.service-arn }}"
+
+          echo "Updating service ${SERVICE_ARN} with image: ${IMAGE_URI}"
+
+          aws apprunner update-service \
+            --region ${{ env.AWS_REGION }} \
+            --service-arn "${SERVICE_ARN}" \
+            --source-configuration "{
+              \"ImageRepository\": {
+                \"ImageIdentifier\": \"${IMAGE_URI}\",
+                \"ImageRepositoryType\": \"ECR\",
+                \"ImageConfiguration\": {
+                  \"Port\": \"3001\"
+                }
+              }
+            }"
+
+          echo "✅ Service update triggered"
+
+      # Print the deployed service URL
+      - name: "📋 Print Service URL"
+        run: |
+          sleep 10  # Brief wait for service metadata to update
+          SERVICE_URL=$(aws apprunner list-services \
+            --region ${{ env.AWS_REGION }} \
+            --query "ServiceSummaryList[?ServiceName=='${{ env.APP_RUNNER_SERVICE }}'].ServiceUrl" \
+            --output text)
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "  ✅ Backend Deployment Complete!"
+          echo "  🌐 App Runner URL : https://${SERVICE_URL}"
+          echo "  🔗 API Base URL   : https://${SERVICE_URL}/api"
+          echo "  🌍 Custom Domain  : https://api.modumichael.me/api"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "⚡ Next step: Copy the API URL above and set it as"
+          echo "   NEXT_PUBLIC_API_URL in the frontend repo's GitHub Secrets"
