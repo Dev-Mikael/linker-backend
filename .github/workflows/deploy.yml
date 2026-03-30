@@ -194,9 +194,23 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Check if the App Runner service already exists
-      # First deploy: CREATE the service
-      # Subsequent deploys: UPDATE the image on the existing service
+      # Reconstruct the image URI directly — don't rely on job outputs
+      # This is more reliable than passing outputs between jobs
+      - name: "🏷️ Set Image URI"
+        id: image
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          IMAGE_URI="${{ env.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:sha-${SHORT_SHA}"
+          echo "uri=${IMAGE_URI}" >> $GITHUB_OUTPUT
+          echo "Image to deploy: ${IMAGE_URI}"
+
+          # Verify the image actually exists in ECR before deploying
+          aws ecr describe-images \
+            --repository-name ${{ env.ECR_REPOSITORY }} \
+            --image-ids imageTag=sha-${SHORT_SHA} \
+            --region ${{ env.AWS_REGION }} > /dev/null
+          echo "✅ Image confirmed in ECR"
+
       - name: "🔎 Check if App Runner Service Exists"
         id: check-service
         run: |
@@ -214,12 +228,10 @@ jobs:
             echo "Service exists: ${SERVICE_ARN}"
           fi
 
-      # FIRST DEPLOY: Create the App Runner service
-      # This runs only once (when the service doesn't exist yet)
       - name: "🆕 Create App Runner Service (First Deploy)"
         if: steps.check-service.outputs.exists == 'false'
         run: |
-          IMAGE_URI="${{ needs.build-and-push.outputs.image-uri }}"
+          IMAGE_URI="${{ steps.image.outputs.uri }}"
           ACCOUNT_ID="${{ secrets.AWS_ACCOUNT_ID }}"
           REGION="${{ env.AWS_REGION }}"
 
@@ -241,7 +253,7 @@ jobs:
                   \"RuntimeEnvironmentVariables\": {
                     \"PORT\": \"3001\",
                     \"NODE_ENV\": \"production\",
-                    \"NEXTAUTH_URL\": \"https://linker.modumichael.me\"
+                    \"NEXTAUTH_URL\": \"https://linker.modumichael.tech\"
                   },
                   \"RuntimeEnvironmentSecrets\": {
                     \"DATABASE_URL\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:linker/DATABASE_URL\",
@@ -266,24 +278,15 @@ jobs:
               \"UnhealthyThreshold\": 5
             }"
 
-          echo "✅ App Runner service created. Waiting for it to become active..."
+          echo "✅ App Runner service created"
 
-          # Wait for service to be running (can take 3-5 minutes on first deploy)
-          aws apprunner wait service-running \
-            --service-arn $(aws apprunner list-services \
-              --region "${REGION}" \
-              --query "ServiceSummaryList[?ServiceName=='${{ env.APP_RUNNER_SERVICE }}'].ServiceArn" \
-              --output text) \
-            --region "${REGION}" || true
-
-      # SUBSEQUENT DEPLOYS: Update the existing service with the new image
       - name: "🔄 Update App Runner Service (Subsequent Deploys)"
         if: steps.check-service.outputs.exists == 'true'
         run: |
-          IMAGE_URI="${{ needs.build-and-push.outputs.image-uri }}"
+          IMAGE_URI="${{ steps.image.outputs.uri }}"
           SERVICE_ARN="${{ steps.check-service.outputs.service-arn }}"
 
-          echo "Updating service ${SERVICE_ARN} with image: ${IMAGE_URI}"
+          echo "Updating service with image: ${IMAGE_URI}"
 
           aws apprunner update-service \
             --region ${{ env.AWS_REGION }} \
@@ -300,10 +303,9 @@ jobs:
 
           echo "✅ Service update triggered"
 
-      # Print the deployed service URL
       - name: "📋 Print Service URL"
         run: |
-          sleep 10  # Brief wait for service metadata to update
+          sleep 10
           SERVICE_URL=$(aws apprunner list-services \
             --region ${{ env.AWS_REGION }} \
             --query "ServiceSummaryList[?ServiceName=='${{ env.APP_RUNNER_SERVICE }}'].ServiceUrl" \
@@ -313,9 +315,9 @@ jobs:
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo "  ✅ Backend Deployment Complete!"
           echo "  🌐 App Runner URL : https://${SERVICE_URL}"
-          echo "  🔗 API Base URL   : https://${SERVICE_URL}/api"
-          echo "  🌍 Custom Domain  : https://api.modumichael.me/api"
+          echo "  🔗 API URL        : https://${SERVICE_URL}/api"
+          echo "  🌍 Custom Domain  : https://api.modumichael.tech/api"
           echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
           echo ""
-          echo "⚡ Next step: Copy the API URL above and set it as"
-          echo "   NEXT_PUBLIC_API_URL in the frontend repo's GitHub Secrets"
+          echo "Copy the API URL and set it as NEXT_PUBLIC_API_URL"
+          echo "in the frontend repository GitHub Secrets."
