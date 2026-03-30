@@ -10,7 +10,7 @@ async function bootstrap() {
   // CORS — allow your frontend to talk to this backend
   app.enableCors({
     origin: [
-      'https://linker.modumichael.tech',
+      'https://linker.modumichael.me',
       'http://localhost:3000',
     ],
     credentials: true,
